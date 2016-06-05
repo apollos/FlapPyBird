@@ -4,6 +4,7 @@ import sys
 
 import pygame
 from pygame.locals import *
+import socket, struct, pickle
 
 
 FPS = 30
@@ -14,6 +15,8 @@ PIPEGAPSIZE  = 100 # gap between upper and lower part of pipe
 BASEY        = SCREENHEIGHT * 0.79
 # image, sound and hitmask  dicts
 IMAGES, SOUNDS, HITMASKS = {}, {}, {}
+robotFlag = False
+robotSock = 0
 
 # list of all possible players (tuple of 3 positions of flap)
 PLAYERS_LIST = (
@@ -23,6 +26,7 @@ PLAYERS_LIST = (
         'assets/sprites/redbird-midflap.png',
         'assets/sprites/redbird-downflap.png',
     ),
+    '''
     # blue bird
     (
         # amount by which base can maximum shift to left
@@ -36,22 +40,33 @@ PLAYERS_LIST = (
         'assets/sprites/yellowbird-midflap.png',
         'assets/sprites/yellowbird-downflap.png',
     ),
+    '''
 )
 
 # list of backgrounds
 BACKGROUNDS_LIST = (
-    'assets/sprites/background-day.png',
-    'assets/sprites/background-night.png',
+    #'assets/sprites/background-day.png',
+    #'assets/sprites/background-night.png',
+    'assets/sprites/background-black.png',
 )
 
 # list of pipes
 PIPES_LIST = (
     'assets/sprites/pipe-green.png',
-    'assets/sprites/pipe-red.png',
+    #'assets/sprites/pipe-red.png',
 )
 
 
-def main():
+def main(argv):
+    global robotFlag
+    robotFlag = False
+    if len(argv) != 3 and len(argv) !=1:
+        print ("Usage: python flappy.py [<target ip> <port>]")
+        exit(-1)
+    if(len(argv) == 3):
+        robotFlag = True
+        host = argv[1]
+        port = argv[2]
     global SCREEN, FPSCLOCK
     pygame.init()
     FPSCLOCK = pygame.time.Clock()
@@ -125,11 +140,46 @@ def main():
             getHitmask(IMAGES['player'][2]),
         )
 
+        if(robotFlag):
+            setConnectWithRobot(host, port)
         movementInfo = showWelcomeAnimation()
         crashInfo = mainGame(movementInfo)
         showGameOverScreen(crashInfo)
 
+def setConnectWithRobot(host, port):
+    global robotSock
+    robotSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    robotSock.settimeout(0.04)
+    robotSock.connect((host, int(port)))  
+    print "Host %s connected\n" % (host)
 
+def rcvDataFromRobot(rcvSock, dataLen):
+    DataValue = ''
+    while len(DataValue) < dataLen:
+        try:
+            packet = rcvSock.recv(dataLen - len(DataValue))
+        except socket.timeout, e:
+            err = e.args[0]
+            # this next if/else is a bit redundant, but illustrates how the
+            # timeout exception is setup
+            if err == 'timed out':
+                break
+            else:
+                print e
+                break
+        except socket.error, e:
+            # Something else happened, handle error, exit, etc.
+            print e
+            break
+        else:
+            if len(packet) == 0:
+                print 'Remote Close!'
+                break
+            else:
+                # got a message do something :)
+                DataValue += packet
+    return DataValue
+    
 def showWelcomeAnimation():
     """Shows welcome screen animation of flappy bird"""
     # index of player to blit on screen
@@ -156,15 +206,30 @@ def showWelcomeAnimation():
             if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
                 pygame.quit()
                 sys.exit()
-            if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
-                # make first flap sound and return values for mainGame
-                SOUNDS['wing'].play()
-                return {
-                    'playery': playery + playerShmVals['val'],
-                    'basex': basex,
-                    'playerIndexGen': playerIndexGen,
-                }
-
+            if(not robotSock):
+                if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
+                    # make first flap sound and return values for mainGame
+                    SOUNDS['wing'].play()
+                    return {
+                        'playery': playery + playerShmVals['val'],
+                        'basex': basex,
+                        'playerIndexGen': playerIndexGen,
+                    }
+        if(robotSock):
+            rcvData = rcvDataFromRobot(robotSock, 16)
+            if (len(rcvData) != 0):
+                actionStr = rcvData.strip("\x00").strip(" ").strip("[").strip("]").split(" ")
+                action = map(int, actionStr)
+                if sum(action) != 1:
+                    print ('Multiple input actions!')
+                elif(action[1] == 1):
+                    # make first flap sound and return values for mainGame
+                    SOUNDS['wing'].play()
+                    return {
+                        'playery': playery + playerShmVals['val'],
+                        'basex': basex,
+                        'playerIndexGen': playerIndexGen,
+                    }
         # adjust playery, playerIndex, basex
         if (loopIter + 1) % 5 == 0:
             playerIndex = playerIndexGen.next()
@@ -182,7 +247,27 @@ def showWelcomeAnimation():
         pygame.display.update()
         FPSCLOCK.tick(FPS)
 
+def sndDataToRobot(sndSock, data, datalen):
+    
+    sndBytes = 0
+    try:  
+        sndBytes = sndSock.send(str(data).ljust(int(datalen)))
+    except socket.error, e:
+            # Something else happened, handle error, exit, etc.
+        print e
 
+    return sndBytes
+
+def saveGameStatus(score, crash):
+    global robotSock
+    if(not robotSock):
+        image_data = pygame.surfarray.array3d(pygame.display.get_surface())
+        image_data_pickle = pickle.dumps(image_data)
+        packStr = '!i?%ds' % len(image_data_pickle)
+        sndStr = struct.pack(packStr, score, crash, image_data_pickle)
+        if(sndDataToRobot(robotSock, len(sndStr), 16) != 16):
+            return
+        sndDataToRobot(robotSock, sndStr, len(sndStr))
 def mainGame(movementInfo):
     score = playerIndex = loopIter = 0
     playerIndexGen = movementInfo['playerIndexGen']
@@ -223,16 +308,30 @@ def mainGame(movementInfo):
             if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
                 pygame.quit()
                 sys.exit()
-            if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
-                if playery > -2 * IMAGES['player'][0].get_height():
-                    playerVelY = playerFlapAcc
-                    playerFlapped = True
-                    SOUNDS['wing'].play()
+            if(not robotSock):
+                if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
+                    if playery > -2 * IMAGES['player'][0].get_height():
+                        playerVelY = playerFlapAcc
+                        playerFlapped = True
+                        SOUNDS['wing'].play()
+        if(robotSock):
+            rcvData = rcvDataFromRobot(robotSock, 16)
+            if (len(rcvData) != 0):
+                actionStr = rcvData.strip("\x00").strip(" ").strip("[").strip("]").split(" ")
+                action = map(int, actionStr)
+                if sum(action) != 1:
+                    print ('Multiple input actions!')
+                elif(action[1] == 1):
+                    if playery > -2 * IMAGES['player'][0].get_height():
+                        playerVelY = playerFlapAcc
+                        playerFlapped = True
+                        SOUNDS['wing'].play()
 
         # check for crash here
         crashTest = checkCrash({'x': playerx, 'y': playery, 'index': playerIndex},
                                upperPipes, lowerPipes)
         if crashTest[0]:
+            saveGameStatus(score, True)
             return {
                 'y': playery,
                 'groundCrash': crashTest[1],
@@ -293,6 +392,8 @@ def mainGame(movementInfo):
         showScore(score)
         SCREEN.blit(IMAGES['player'][playerIndex], (playerx, playery))
 
+        if(robotSock):
+            saveGameStatus(score, False)
         pygame.display.update()
         FPSCLOCK.tick(FPS)
 
@@ -448,4 +549,4 @@ def getHitmask(image):
     return mask
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv)
